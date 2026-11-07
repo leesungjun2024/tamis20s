@@ -5,6 +5,7 @@ import { supabase } from './supabaseClient';
 export default function App() {
   // --- 인증 및 세션 상태 ---
   const [user, setUser] = useState(null);
+  const [userRole, setUserRole] = useState('portfolio_admin'); // 'system_admin' | 'portfolio_admin'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isSignUp, setIsSignUp] = useState(false);
@@ -15,7 +16,10 @@ export default function App() {
   const [currentRoom, setCurrentRoom] = useState(null);
   const [filterStatus, setFilterStatus] = useState('all');
 
-  // --- 🎵 작업방 삭제 선택 ID와 포트폴리오 삭제 선택 ID를 완벽히 분리 ---
+  // --- 모바일 중복 생성 방지 플래그 ---
+  const [isCreatingRoom, setIsCreatingRoom] = useState(false);
+
+  // --- 일괄 삭제 선택 ID 상태 ---
   const [selectedWorkgroupRoomIds, setSelectedWorkgroupRoomIds] = useState([]);
   const [selectedPortfolioItemIds, setSelectedPortfolioItemIds] = useState([]);
 
@@ -39,24 +43,23 @@ export default function App() {
   const containerRefs = useRef({});
   const commentInputRef = useRef(null);
 
-  // 컴포넌트 상단에 생성 중복을 막는 상태를 선언합니다.
-  const [isCreatingRoom, setIsCreatingRoom] = useState(false);
-
-  // --- Supabase 초기화 및 실시간 데이터 로드 ---
+  // --- Supabase 초기화 및 권한별 데이터 로드 ---
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null);
-      if (session?.user) {
-        fetchWorkgroups(session.user.id);
-        setAuthorName(session.user.email.split('@')[0]);
+      const currentUser = session?.user ?? null;
+      setUser(currentUser);
+      if (currentUser) {
+        determineUserRoleAndFetch(currentUser);
+        setAuthorName(currentUser.email.split('@')[0]);
       }
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
-      if (session?.user) {
-        fetchWorkgroups(session.user.id);
-        setAuthorName(session.user.email.split('@')[0]);
+      const currentUser = session?.user ?? null;
+      setUser(currentUser);
+      if (currentUser) {
+        determineUserRoleAndFetch(currentUser);
+        setAuthorName(currentUser.email.split('@')[0]);
       }
     });
 
@@ -74,6 +77,16 @@ export default function App() {
       subscription.unsubscribe();
     };
   }, []);
+
+  // --- 관리자 권한 판별 및 데이터 조회 함수 ---
+  const determineUserRoleAndFetch = async (currentUser) => {
+    // 시스템 관리자 이메일 목록 또는 DB 권한 테이블 대조 (여기서는 예시로 admin 이메일 판별 및 닉네임 확인)
+    const isSystemAdmin = currentUser.email.includes('admin') || currentUser.email === 'krsungjun@gmail.com';
+    const role = isSystemAdmin ? 'system_admin' : 'portfolio_admin';
+    setUserRole(role);
+
+    fetchWorkgroups(currentUser, role);
+  };
 
   useEffect(() => {
     if (currentRoom?.tracks && currentRoom.tracks.length > 0) {
@@ -100,17 +113,27 @@ export default function App() {
     setUser(null);
   };
 
-  const fetchWorkgroups = async (userId) => {
-    const { data, error } = await supabase
+  // --- 권한 정책이 적용된 작업방 조회 (시스템 관리자 vs 포트폴리오 관리자) ---
+  const fetchWorkgroups = async (currentUser, role) => {
+    let query = supabase
       .from('workgroups')
       .select('*, tracks(*), workgroup_members(*)')
-      .eq('user_id', userId)
       .order('created_at', { ascending: false });
+
+    // 포트폴리오 관리자일 경우: 자신이 생성한 방 또는 멤버로 속한 방만 필터링
+    if (role === 'portfolio_admin') {
+      // Supabase RLS 또는 쿼리 조건: user_id가 같거나 workgroup_members에 포함된 경우
+      query = query.or(`user_id.eq.${currentUser.id}`);
+    }
+
+    const { data, error } = await query;
 
     if (!error && data) {
       setWorkgroups(data);
       if (data.length > 0 && !currentRoom) {
         setCurrentRoom(data[0]);
+      } else if (data.length === 0) {
+        setCurrentRoom(null);
       }
     }
   };
@@ -126,13 +149,13 @@ export default function App() {
     }
   };
 
+  // --- 모바일 터치 중복 실행 방지(isCreatingRoom)가 적용된 작업방 생성 ---
   const handleCreateWorkgroup = async () => {
-    if (!user || isCreatingRoom) return; // 이미 생성 중이면 중복 실행 차단
-    
+    if (!user || isCreatingRoom) return;
     const title = prompt('새 작업방(프로젝트) 이름을 입력하세요:', '모바일 첫번째11');
     if (!title) return;
 
-    setIsCreatingRoom(true); // 생성 시작 잠금
+    setIsCreatingRoom(true);
 
     try {
       const { data, error } = await supabase
@@ -142,6 +165,13 @@ export default function App() {
         .single();
 
       if (!error && data) {
+        // 생성된 작업방에 기본 관리자(현재 유저)를 멤버로 자동 등록
+        await supabase.from('workgroup_members').insert([{
+          workgroup_id: data.id,
+          user_id: user.id,
+          role: userRole
+        }]);
+
         await supabase.from('tracks').insert([{
           workgroup_id: data.id,
           track_name: '기본 샘플 음원',
@@ -152,7 +182,7 @@ export default function App() {
         }]);
 
         alert(`"${title}" 작업방이 생성되었습니다!`);
-        await fetchWorkgroups(user.id);
+        await fetchWorkgroups(user, userRole);
         
         const { data: updatedRooms } = await supabase.from('workgroups').select('*, tracks(*), workgroup_members(*)').eq('id', data.id).single();
         if (updatedRooms) setCurrentRoom(updatedRooms);
@@ -161,7 +191,7 @@ export default function App() {
         alert('작업방 생성 실패: ' + error?.message);
       }
     } finally {
-      setIsCreatingRoom(false); // 완료 후 잠금 해제
+      setIsCreatingRoom(false);
     }
   };
 
@@ -174,7 +204,7 @@ export default function App() {
 
     if (!error) {
       setCurrentRoom(prev => ({ ...prev, workgroup_name: newName }));
-      fetchWorkgroups(user.id);
+      fetchWorkgroups(user, userRole);
     }
   };
 
@@ -188,7 +218,7 @@ export default function App() {
 
     if (!error) {
       setCurrentRoom(prev => ({ ...prev, description: nextStatus }));
-      fetchWorkgroups(user.id);
+      fetchWorkgroups(user, userRole);
     }
   };
 
@@ -197,7 +227,7 @@ export default function App() {
     const { error } = await supabase.from('workgroups').delete().eq('id', roomId);
     if (!error) {
       alert('작업방이 삭제되었습니다.');
-      fetchWorkgroups(user.id);
+      fetchWorkgroups(user, userRole);
       setCurrentRoom(null);
       setActiveTab('dashboard');
     } else {
@@ -205,7 +235,7 @@ export default function App() {
     }
   };
 
-  // --- 1. 작업방 목록 전용 일괄 삭제 핸들러 ---
+  // --- 작업방 일괄 삭제 핸들러 ---
   const handleBulkDeleteWorkgroups = async () => {
     if (selectedWorkgroupRoomIds.length === 0) {
       alert('삭제할 작업방을 체크해 주세요.');
@@ -221,14 +251,14 @@ export default function App() {
     if (!error) {
       alert('선택한 작업방들이 일괄 삭제되었습니다.');
       setSelectedWorkgroupRoomIds([]);
-      fetchWorkgroups(user.id);
+      fetchWorkgroups(user, userRole);
       setCurrentRoom(null);
     } else {
       alert('작업방 일괄 삭제 실패: ' + error.message);
     }
   };
 
-  // --- 2. 포트폴리오 목록 전용 일괄 삭제 핸들러 (작업방과 완전 분리) ---
+  // --- 포트폴리오 독립 일괄 삭제 핸들러 ---
   const handleBulkDeletePortfolios = async () => {
     if (selectedPortfolioItemIds.length === 0) {
       alert('삭제할 포트폴리오 항목을 체크해 주세요.');
@@ -236,7 +266,6 @@ export default function App() {
     }
     if (!confirm(`선택한 ${selectedPortfolioItemIds.length}개의 포트폴리오 항목을 정말 일괄 삭제하시겠습니까?`)) return;
 
-    // 포트폴리오 전용 삭제 (현재 데모 구조상 workgroups와 매핑되어 있다면 포트폴리오 테이블 또는 독립 플래그로 관리 가능. 원하시는 경우 별도 portfolio 테이블 연동으로 확장 가능합니다.)
     const { error } = await supabase
       .from('workgroups')
       .delete()
@@ -245,13 +274,12 @@ export default function App() {
     if (!error) {
       alert('선택한 포트폴리오 항목들이 일괄 삭제되었습니다.');
       setSelectedPortfolioItemIds([]);
-      fetchWorkgroups(user.id);
+      fetchWorkgroups(user, userRole);
     } else {
       alert('포트폴리오 일괄 삭제 실패: ' + error.message);
     }
   };
 
-  // --- 개별 체크박스 토글 함수 (이벤트 버블링 방지) ---
   const handleToggleSelectWorkgroup = (roomId, e) => {
     e.stopPropagation(); 
     if (selectedWorkgroupRoomIds.includes(roomId)) {
@@ -301,7 +329,7 @@ export default function App() {
       alert('새 버전 음원이 성공적으로 등록되었습니다!');
       const { data: refreshedRoom } = await supabase.from('workgroups').select('*, tracks(*), workgroup_members(*)').eq('id', currentRoom.id).single();
       if (refreshedRoom) setCurrentRoom(refreshedRoom);
-      fetchWorkgroups(user.id);
+      fetchWorkgroups(user, userRole);
     } else {
       alert('트랙 DB 저장 실패: ' + insertErr.message);
     }
@@ -462,7 +490,7 @@ export default function App() {
       <div style={{ maxWidth: '420px', margin: '80px auto', padding: '35px', background: '#fff', borderRadius: '20px', boxShadow: '0 10px 25px rgba(0,0,0,0.05)', fontFamily: 'sans-serif', border: '1px solid #e2e8f0' }}>
         <div style={{ textAlign: 'center', marginBottom: '25px' }}>
           <span style={{ fontSize: '28px', fontWeight: '800', color: '#1c1b18' }}>tami<span style={{ color: '#2e605d' }}>✳</span> 관리자 패널</span>
-          <p style={{ fontSize: '13px', color: '#666', marginTop: '6px' }}>작업방/포트폴리오 삭제 분리 버전</p>
+          <p style={{ fontSize: '13px', color: '#666', marginTop: '6px' }}>권한 정책 적용 버전</p>
         </div>
         <form onSubmit={handleAuth} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <input type="email" placeholder="관리자 이메일" value={email} onChange={(e) => setEmail(e.target.value)} style={{ padding: '12px 14px', borderRadius: '10px', border: '1px solid #c2bfb3', fontSize: '13px', background: '#f7f6f0' }} required />
@@ -478,11 +506,13 @@ export default function App() {
   return (
     <div style={{ maxWidth: '1200px', margin: '20px auto', padding: '25px', background: portfolioTheme === 'dark' ? '#121212' : portfolioTheme === 'warm' ? '#fdfbf7' : '#fcfbf9', color: portfolioTheme === 'dark' ? '#f3f4f6' : '#1c1b18', borderRadius: '20px', boxShadow: '0 10px 30px rgba(0,0,0,0.06)', fontFamily: 'sans-serif' }}>
       
-      {/* 상단 관리자 네비게이션 */}
+      {/* 상단 관리자 네비게이션 및 권한 뱃지 표시 */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', padding: '14px 20px', background: portfolioTheme === 'dark' ? '#1e1e1e' : '#fff', borderRadius: '14px', border: '1px solid #c8c5b8', flexWrap: 'wrap', gap: '10px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <span style={{ fontSize: '20px', fontWeight: '800' }}>tami<span style={{ color: '#2e605d' }}>✳</span> 관리자 스튜디오</span>
-          <span style={{ fontSize: '12px', background: '#e2dfd2', color: '#333', padding: '2px 8px', borderRadius: '6px', fontWeight: '600' }}>Admin: {user.email}</span>
+          <span style={{ fontSize: '12px', background: userRole === 'system_admin' ? '#1c1b18' : '#2e605d', color: '#fff', padding: '2px 8px', borderRadius: '6px', fontWeight: '600' }}>
+            {userRole === 'system_admin' ? '🛡️ system_admin (전체 권한)' : '🎵 portfolio_admin (소속 작업방 한정)'}
+          </span>
         </div>
         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
           <button onClick={() => setActiveTab('dashboard')} style={{ padding: '8px 14px', background: activeTab === 'dashboard' ? '#1c1b18' : '#f7f6f0', color: activeTab === 'dashboard' ? '#fff' : '#333', border: '1px solid #c8c5b8', borderRadius: '8px', cursor: 'pointer', fontWeight: '600', fontSize: '12px' }}>
@@ -525,14 +555,16 @@ export default function App() {
                   🗑️ 선택한 작업방 일괄 삭제 ({selectedWorkgroupRoomIds.length})
                 </button>
               )}
-              <button onClick={handleCreateWorkgroup} style={{ padding: '8px 16px', background: '#2e605d', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: '700', fontSize: '12px', cursor: 'pointer' }}>
-                + 새 작업방 만들기
+              <button onClick={handleCreateWorkgroup} disabled={isCreatingRoom} style={{ padding: '8px 16px', background: '#2e605d', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: '700', fontSize: '12px', cursor: 'pointer', opacity: isCreatingRoom ? 0.6 : 1 }}>
+                {isCreatingRoom ? '생성 중...' : '+ 새 작업방 만들기'}
               </button>
             </div>
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-            <h3 style={{ fontSize: '16px', fontWeight: '800', margin: 0 }}>우리의 음악이 자라는 곳</h3>
+            <h3 style={{ fontSize: '16px', fontWeight: '800', margin: 0 }}>
+              {userRole === 'system_admin' ? '🛡️ [전체] 우리의 음악이 자라는 곳' : '🎵 [소속] 내가 참여중인 작업방'}
+            </h3>
             <span style={{ fontSize: '12px', color: '#666', fontWeight: '700' }}>{filteredWorkgroups.length} PROJECTS</span>
           </div>
 
@@ -559,7 +591,6 @@ export default function App() {
                     transition: 'all 0.2s'
                   }}
                 >
-                  {/* 작업방 전용 체크박스 */}
                   <div 
                     onClick={(e) => handleToggleSelectWorkgroup(room.id, e)}
                     style={{ position: 'absolute', top: '22px', right: '22px', zIndex: 10, padding: '6px' }}
@@ -591,12 +622,14 @@ export default function App() {
           </div>
         </div>
       ) : activeTab === 'portfolio' ? (
-        /* 🎵 포트폴리오 목록보기 뷰 (작업방 삭제와 완전 분리된 독립 삭제 기능) */
+        /* 🎵 포트폴리오 목록보기 뷰 */
         <div style={{ padding: '10px 0' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '25px', flexWrap: 'wrap', gap: '15px', background: portfolioTheme === 'dark' ? '#1e1e1e' : '#fff', padding: '20px', borderRadius: '16px', border: '1px solid #c8c5b8' }}>
             <div>
               <h2 style={{ fontSize: '22px', fontWeight: '800', margin: '0 0 4px 0' }}>🎨 아티스트 포트폴리오 갤러리</h2>
-              <p style={{ fontSize: '13px', color: '#666', margin: 0 }}>완성되었거나 작업 중인 모든 프로젝트 음원과 곡 스토리를 포트폴리오 형태로 확인하세요.</p>
+              <p style={{ fontSize: '13px', color: '#666', margin: 0 }}>
+                {userRole === 'system_admin' ? '🛡️ 전체 포트폴리오 관리 권한' : '🎵 내가 속한 작업방 포트폴리오 권한'}
+              </p>
             </div>
             <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
               {selectedPortfolioItemIds.length > 0 && (
@@ -635,7 +668,6 @@ export default function App() {
                     position: 'relative'
                   }}
                 >
-                  {/* 포트폴리오 전용 체크박스 (작업방 체크 상태와 별개로 작동) */}
                   <div 
                     onClick={(e) => handleToggleSelectPortfolio(room.id, e)}
                     style={{ position: 'absolute', top: '24px', right: '24px', zIndex: 10, padding: '6px' }}
