@@ -21,7 +21,7 @@ export default function App() {
 
   const [projectName, setProjectName] = useState('나의 새 프로젝트');
 
-  // 트랙 리스트 (내 파일 vs 팀원/타인 파일 구분)
+  // 트랙 리스트 (내 파일 vs 팀원/타인 파일 구분) 
   const [tracks, setTracks] = useState([
     { id: 'vocal', title: '🎤 보컬 스템 (내 음악)', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3', muted: false, uploader: 'mine', order: 1 },
     { id: 'instrumental', title: '🎸 악기 스템 (팀원/타인 음악)', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3', muted: false, uploader: 'team', order: 2 },
